@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+jsbeautifier
+flake8
+black
+pre-commit

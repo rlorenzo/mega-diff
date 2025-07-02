@@ -1,0 +1,25 @@
+# Ignore specific directories
+/mega_diff_output/
+/.claude/
+__pycache__/
+venv/
+
+# Ignore test and coverage output
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ignore editor/IDE files
+.vscode/
+.idea/
+
+# Ignore macOS specific files
+.DS_Store
+
+# Ignore Windows system files
+Thumbs.db
+
+# Ignore log and backup files
+*.log
+*~
+*.swp

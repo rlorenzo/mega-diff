@@ -9,6 +9,7 @@ import difflib
 import html
 import re
 from jsbeautifier import beautify
+from deepdiff import DeepDiff  # NEW
 
 
 def _get_file_extension_from_content_type(content_type):
@@ -374,9 +375,20 @@ def generate_html_report(diff_results, output_path):
     html_diffs_str = ""
     if diff_results["html"]:
         for diff_item in diff_results["html"]:
-            html_diffs_str += f"<div class='summary-item'><h3>HTML Content Diff</h3><div class='diff-content'>{format_diff_lines(diff_item['diff'])}</div></div>"
+            if diff_item["type"] == "html-semantic":
+                html_diffs_str += f"<div class='summary-item'><h3>HTML Semantic Diff (DeepDiff)</h3><div class='diff-content'><pre>{html.escape(str(diff_item['deepdiff']))}</pre></div>"
+                if diff_item["visual"]:
+                    html_diffs_str += f"<h4>Visual Diff</h4><div class='diff-content'>{format_diff_lines(diff_item['visual'])}</div>"
+                html_diffs_str += "</div>"
+            elif diff_item["type"] == "html-visual":
+                html_diffs_str += f"<div class='summary-item'><h3>HTML Visual Diff</h3><div class='diff-content'>{format_diff_lines(diff_item['diff'])}</div></div>"
     else:
-        html_diffs_str = "<p>No HTML differences found.</p>"
+        html_diffs_str = (
+            "<p style='color: red; font-weight: bold;'>"
+            "Failed to fetch one or both HTML files. This is usually due to a network error, SSL certificate issue, or the URL being unreachable. "
+            "Check the console output for details. No HTML comparison was performed."
+            "</p>"
+        )
 
     css_diffs_str = ""
     if diff_results["css"]:
@@ -438,6 +450,27 @@ def generate_html_report(diff_results, output_path):
         f.write(final_html)
 
 
+def soup_to_dict(soup):
+    # Recursively convert a BeautifulSoup tag to a dict for DeepDiff
+    if isinstance(soup, str):
+        return soup
+    if hasattr(soup, "name") and soup.name is not None:
+        return {
+            "tag": soup.name,
+            "attrs": dict(soup.attrs),
+            "children": [
+                soup_to_dict(child)
+                for child in soup.children
+                if getattr(child, "name", None)
+                or (isinstance(child, str) and child.strip())
+            ],
+        }
+    elif hasattr(soup, "contents"):
+        return [soup_to_dict(child) for child in soup.contents]
+    else:
+        return str(soup)
+
+
 def _compare_html(working_files, broken_files, working_url, broken_url, diff_results):
     """Compares HTML content and adds diff to results."""
     if working_files["html"] and broken_files["html"]:
@@ -446,6 +479,7 @@ def _compare_html(working_files, broken_files, working_url, broken_url, diff_res
         with open(broken_files["html"], "r", encoding="utf-8") as f:
             broken_html_content = f.read()
 
+        # Old normalization (kept for visual diff)
         normalized_working_html = normalize_content(working_html_content, "html")
         normalized_broken_html = normalize_content(broken_html_content, "html")
 
@@ -456,6 +490,23 @@ def _compare_html(working_files, broken_files, working_url, broken_url, diff_res
             normalized_broken_html, working_url, broken_url
         )
 
+        # DeepDiff-based semantic diff
+        soup1 = BeautifulSoup(working_html_content, "html.parser")
+        soup2 = BeautifulSoup(broken_html_content, "html.parser")
+        dict1 = soup_to_dict(soup1)
+        dict2 = soup_to_dict(soup2)
+        deepdiff_result = DeepDiff(dict1, dict2, ignore_order=True)
+        if deepdiff_result:
+            diff_results["html"].append(
+                {
+                    "type": "html-semantic",
+                    "deepdiff": deepdiff_result,
+                    "visual": None,  # Will fill below if also visual diff
+                }
+            )
+        # else: (no need to print)
+
+        # Optionally, keep the visual diff for user reference
         html_diff = list(
             difflib.unified_diff(
                 filtered_working_html.splitlines(keepends=True),
@@ -465,9 +516,18 @@ def _compare_html(working_files, broken_files, working_url, broken_url, diff_res
             )
         )
         if html_diff:
-            diff_results["html"].append({"type": "html", "diff": "".join(html_diff)})
-            print("\nHTML Differences Found.")
-        else:
+            # Attach to the last html diff result if semantic diff found, else add new
+            if (
+                diff_results["html"]
+                and diff_results["html"][-1]["type"] == "html-semantic"
+            ):
+                diff_results["html"][-1]["visual"] = "".join(html_diff)
+            else:
+                diff_results["html"].append(
+                    {"type": "html-visual", "diff": "".join(html_diff)}
+                )
+                print("\nHTML Visual Differences Found.")
+        elif not deepdiff_result:
             print("\nNo HTML Differences Found.")
 
 
@@ -735,6 +795,20 @@ def main():
     print(f"Broken JS files: {len(broken_files['js'])}")
     print(f"Working Image files: {len(working_files['images'])}")
     print(f"Broken Image files: {len(broken_files['images'])}")
+
+    # Abort all diffing if either HTML file is missing (fetch failed)
+    # This ensures we do not produce misleading diffs or reports if a page is unreachable
+    missing = []
+    if not working_files.get("html"):
+        missing.append(f"working_url: {args.working_url}")
+    if not broken_files.get("html"):
+        missing.append(f"broken_url: {args.broken_url}")
+    if missing:
+        print("\nERROR: Failed to fetch the following HTML file(s):")
+        for url_label in missing:
+            print(f"  - {url_label}")
+        print("Aborting all diff operations. No report generated.")
+        exit(1)
 
     diff_results = {"html": [], "css": [], "js": [], "images": []}
 

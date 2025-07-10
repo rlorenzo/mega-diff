@@ -110,6 +110,91 @@ class TestMegaDiff(unittest.TestCase):
         # Also check that no KeyError or formatting error occurred
         self.assertNotIn("KeyError", html_content)
 
+    def test_html_diff_detects_class_name_difference(self):
+        from mega_diff import normalize_content, filter_content_for_diff
+        import difflib
+
+        html1 = '<div class="section-intro__body">Hello</div>'
+        html2 = '<div class="section-intro-body">Hello</div>'
+        norm1 = normalize_content(html1, "html")
+        norm2 = normalize_content(html2, "html")
+        filtered1 = filter_content_for_diff(norm1, "https://a.com", "https://b.com")
+        filtered2 = filter_content_for_diff(norm2, "https://a.com", "https://b.com")
+        diff = list(
+            difflib.unified_diff(
+                filtered1.splitlines(keepends=True),
+                filtered2.splitlines(keepends=True),
+                fromfile="working.html",
+                tofile="broken.html",
+            )
+        )
+        # There should be a diff line showing the class name difference
+        diff_str = "".join(diff)
+        self.assertIn("section-intro__body", diff_str)
+        self.assertIn("section-intro-body", diff_str)
+
+
+# Utility function to convert a BeautifulSoup tag to a dict for DeepDiff
+def soup_to_dict(soup):
+    """
+    Recursively convert a BeautifulSoup tag or NavigableString to a dict for DeepDiff.
+    Strings are returned as-is. Tags are represented as dicts with 'tag', 'attrs', and 'children'.
+    """
+    if isinstance(soup, str):
+        return soup
+    if hasattr(soup, "name") and soup.name is not None:
+        return {
+            "tag": soup.name,
+            "attrs": dict(soup.attrs),
+            "children": [
+                soup_to_dict(child)
+                for child in soup.children
+                if getattr(child, "name", None)
+                or (isinstance(child, str) and child.strip())
+            ],
+        }
+    elif hasattr(soup, "contents"):
+        return [soup_to_dict(child) for child in soup.contents]
+    else:
+        return str(soup)
+
+    def test_deepdiff_detects_html_class_name_difference(self):
+        """
+        Test that DeepDiff detects a difference in class names between two HTML snippets.
+        """
+        from bs4 import BeautifulSoup
+        from deepdiff import DeepDiff
+
+        html1 = '<div class="section-intro__body">Hello</div>'
+        html2 = '<div class="section-intro-body">Hello</div>'
+        soup1 = BeautifulSoup(html1, "html.parser")
+        soup2 = BeautifulSoup(html2, "html.parser")
+        dict1 = soup_to_dict(soup1.div)
+        dict2 = soup_to_dict(soup2.div)
+        diff = DeepDiff(dict1, dict2, ignore_order=True)
+        # The diff should show a change in the class attribute
+        self.assertIn("values_changed", diff)
+        self.assertIn("section-intro__body", str(diff))
+        self.assertIn("section-intro-body", str(diff))
+
+    def test_deepdiff_detects_nested_html_difference(self):
+        """
+        Test that DeepDiff detects differences in nested HTML structures and multiple attributes.
+        """
+        from bs4 import BeautifulSoup
+        from deepdiff import DeepDiff
+
+        html1 = '<div class="outer" id="main"><span class="inner">Text</span></div>'
+        html2 = '<div class="outer" id="main"><span class="inner-modified">Text</span></div>'
+        soup1 = BeautifulSoup(html1, "html.parser")
+        soup2 = BeautifulSoup(html2, "html.parser")
+        dict1 = soup_to_dict(soup1.div)
+        dict2 = soup_to_dict(soup2.div)
+        diff = DeepDiff(dict1, dict2, ignore_order=True)
+        self.assertIn("values_changed", diff)
+        self.assertIn("inner", str(diff))
+        self.assertIn("inner-modified", str(diff))
+
 
 if __name__ == "__main__":
     unittest.main()

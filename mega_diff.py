@@ -978,14 +978,16 @@ def _compare_data_uri_images(working_data_uris, broken_data_uris, diff_results):
                     {
                         "file": data_uri_name,
                         "status": "hash mismatch (data URI)",
-                        "working_data_uri": working_uri["content"][
-                            :DATA_URI_PREVIEW_LENGTH
-                        ]
-                        + "...",
-                        "broken_data_uri": broken_uri["content"][
-                            :DATA_URI_PREVIEW_LENGTH
-                        ]
-                        + "...",
+                        "working_data_uri": (
+                            working_uri["content"][:DATA_URI_PREVIEW_LENGTH] + "..."
+                            if len(working_uri["content"]) > DATA_URI_PREVIEW_LENGTH
+                            else working_uri["content"]
+                        ),
+                        "broken_data_uri": (
+                            broken_uri["content"][:DATA_URI_PREVIEW_LENGTH] + "..."
+                            if len(broken_uri["content"]) > DATA_URI_PREVIEW_LENGTH
+                            else broken_uri["content"]
+                        ),
                     }
                 )
                 logger.info("  Data URI Images differ: %s", data_uri_name)

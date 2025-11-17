@@ -470,6 +470,25 @@ class TestMegaDiff(unittest.TestCase):
         self.assertEqual(len(preview), DATA_URI_PREVIEW_LENGTH + 3)  # +3 for "..."
         self.assertTrue(preview.endswith("..."))
 
+    def test_compare_data_uri_images_short_uri_not_truncated(self):
+        """Test _compare_data_uri_images does not truncate short URIs."""
+        short_uri_working = "data:image/png;base64,ABC"
+        short_uri_broken = "data:image/png;base64,DEF"
+        working_uris = [{"name": "img1", "content": short_uri_working}]
+        broken_uris = [{"name": "img1", "content": short_uri_broken}]
+        diff_results = {"images": []}
+
+        _compare_data_uri_images(working_uris, broken_uris, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        # Short URIs should not have "..." appended
+        working_preview = diff_results["images"][0]["working_data_uri"]
+        broken_preview = diff_results["images"][0]["broken_data_uri"]
+        self.assertEqual(working_preview, short_uri_working)
+        self.assertEqual(broken_preview, short_uri_broken)
+        self.assertFalse(working_preview.endswith("..."))
+        self.assertFalse(broken_preview.endswith("..."))
+
 
 if __name__ == "__main__":
     unittest.main()

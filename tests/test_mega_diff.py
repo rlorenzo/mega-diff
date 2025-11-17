@@ -8,6 +8,7 @@ from mega_diff import (
     normalize_content,
     calculate_file_hash,
     filter_content_for_diff,
+    soup_to_dict,
 )
 
 
@@ -133,36 +134,10 @@ class TestMegaDiff(unittest.TestCase):
         self.assertIn("section-intro__body", diff_str)
         self.assertIn("section-intro-body", diff_str)
 
-
-# Utility function to convert a BeautifulSoup tag to a dict for DeepDiff
-def soup_to_dict(soup):
-    """
-    Recursively convert a BeautifulSoup tag or NavigableString to a dict for DeepDiff.
-    Strings are returned as-is. Tags are represented as dicts with 'tag', 'attrs', and 'children'.
-    """
-    if isinstance(soup, str):
-        return soup
-    if hasattr(soup, "name") and soup.name is not None:
-        return {
-            "tag": soup.name,
-            "attrs": dict(soup.attrs),
-            "children": [
-                soup_to_dict(child)
-                for child in soup.children
-                if getattr(child, "name", None)
-                or (isinstance(child, str) and child.strip())
-            ],
-        }
-    elif hasattr(soup, "contents"):
-        return [soup_to_dict(child) for child in soup.contents]
-    else:
-        return str(soup)
-
     def test_deepdiff_detects_html_class_name_difference(self):
         """
         Test that DeepDiff detects a difference in class names between two HTML snippets.
         """
-        from bs4 import BeautifulSoup
         from deepdiff import DeepDiff
 
         html1 = '<div class="section-intro__body">Hello</div>'
@@ -181,7 +156,6 @@ def soup_to_dict(soup):
         """
         Test that DeepDiff detects differences in nested HTML structures and multiple attributes.
         """
-        from bs4 import BeautifulSoup
         from deepdiff import DeepDiff
 
         html1 = '<div class="outer" id="main"><span class="inner">Text</span></div>'

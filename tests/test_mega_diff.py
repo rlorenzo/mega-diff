@@ -1,5 +1,7 @@
 import unittest
 import hashlib
+import tempfile
+import os
 from unittest.mock import patch, mock_open
 from bs4 import BeautifulSoup
 from bs4.element import Comment
@@ -9,6 +11,13 @@ from mega_diff import (
     calculate_file_hash,
     filter_content_for_diff,
     soup_to_dict,
+    _create_file_map,
+    _format_diff_lines,
+    _compare_single_text_file,
+    _separate_image_types,
+    _compare_regular_images,
+    _compare_data_uri_images,
+    DATA_URI_PREVIEW_LENGTH,
 )
 
 
@@ -168,6 +177,298 @@ class TestMegaDiff(unittest.TestCase):
         self.assertIn("values_changed", diff)
         self.assertIn("inner", str(diff))
         self.assertIn("inner-modified", str(diff))
+
+    def test_create_file_map_basic(self):
+        """Test _create_file_map with basic file list."""
+        file_list = ["/path/to/style.css", "/another/path/main.js", "/home/index.html"]
+        result = _create_file_map(file_list)
+        expected = {
+            "style.css": "/path/to/style.css",
+            "main.js": "/another/path/main.js",
+            "index.html": "/home/index.html",
+        }
+        self.assertEqual(result, expected)
+
+    def test_create_file_map_empty_list(self):
+        """Test _create_file_map with empty list."""
+        result = _create_file_map([])
+        self.assertEqual(result, {})
+
+    def test_create_file_map_duplicate_basenames(self):
+        """Test _create_file_map when duplicate basenames exist (last one wins)."""
+        file_list = ["/path1/style.css", "/path2/style.css"]
+        result = _create_file_map(file_list)
+        # The second path should overwrite the first
+        self.assertEqual(result, {"style.css": "/path2/style.css"})
+
+    def test_format_diff_lines_added(self):
+        """Test _format_diff_lines correctly formats added lines."""
+        diff_text = "+added line"
+        result = _format_diff_lines(diff_text)
+        self.assertIn('class="diff-added"', result)
+        self.assertIn("+added line", result)
+
+    def test_format_diff_lines_removed(self):
+        """Test _format_diff_lines correctly formats removed lines."""
+        diff_text = "-removed line"
+        result = _format_diff_lines(diff_text)
+        self.assertIn('class="diff-removed"', result)
+        self.assertIn("-removed line", result)
+
+    def test_format_diff_lines_unchanged(self):
+        """Test _format_diff_lines correctly formats unchanged lines."""
+        diff_text = " unchanged line"
+        result = _format_diff_lines(diff_text)
+        self.assertIn('class="diff-unchanged"', result)
+        self.assertIn(" unchanged line", result)
+
+    def test_format_diff_lines_html_escaping(self):
+        """Test _format_diff_lines properly escapes HTML characters."""
+        diff_text = "+<script>alert('xss')</script>"
+        result = _format_diff_lines(diff_text)
+        self.assertIn("&lt;script&gt;", result)
+        self.assertIn("&lt;/script&gt;", result)
+        self.assertNotIn("<script>", result)
+
+    def test_format_diff_lines_multiple_lines(self):
+        """Test _format_diff_lines handles multiple lines correctly."""
+        diff_text = "+added\n-removed\n unchanged"
+        result = _format_diff_lines(diff_text)
+        self.assertIn('class="diff-added"', result)
+        self.assertIn('class="diff-removed"', result)
+        self.assertIn('class="diff-unchanged"', result)
+
+    def test_separate_image_types_mixed(self):
+        """Test _separate_image_types correctly separates mixed image types."""
+        image_list = [
+            "/path/to/image1.jpg",
+            {
+                "type": "data_uri",
+                "name": "data_uri_image_0",
+                "content": "data:image/png;base64,ABC",
+            },
+            "/path/to/image2.png",
+            {
+                "type": "data_uri",
+                "name": "data_uri_image_1",
+                "content": "data:image/gif;base64,DEF",
+            },
+        ]
+        regular, data_uris = _separate_image_types(image_list)
+        self.assertEqual(len(regular), 2)
+        self.assertEqual(len(data_uris), 2)
+        self.assertIn("/path/to/image1.jpg", regular)
+        self.assertIn("/path/to/image2.png", regular)
+        self.assertEqual(data_uris[0]["name"], "data_uri_image_0")
+        self.assertEqual(data_uris[1]["name"], "data_uri_image_1")
+
+    def test_separate_image_types_empty(self):
+        """Test _separate_image_types with empty list."""
+        regular, data_uris = _separate_image_types([])
+        self.assertEqual(regular, [])
+        self.assertEqual(data_uris, [])
+
+    def test_separate_image_types_only_regular(self):
+        """Test _separate_image_types with only regular images."""
+        image_list = ["/path/image1.jpg", "/path/image2.png"]
+        regular, data_uris = _separate_image_types(image_list)
+        self.assertEqual(len(regular), 2)
+        self.assertEqual(len(data_uris), 0)
+
+    def test_separate_image_types_only_data_uri(self):
+        """Test _separate_image_types with only data URI images."""
+        image_list = [
+            {"type": "data_uri", "name": "img1", "content": "data:..."},
+            {"type": "data_uri", "name": "img2", "content": "data:..."},
+        ]
+        regular, data_uris = _separate_image_types(image_list)
+        self.assertEqual(len(regular), 0)
+        self.assertEqual(len(data_uris), 2)
+
+    def test_separate_image_types_ignores_invalid_dicts(self):
+        """Test _separate_image_types ignores dictionaries without type='data_uri'."""
+        image_list = [
+            "/path/image.jpg",
+            {"type": "other", "name": "invalid"},
+            {"name": "no_type"},
+        ]
+        regular, data_uris = _separate_image_types(image_list)
+        self.assertEqual(len(regular), 1)
+        self.assertEqual(len(data_uris), 0)
+
+    def test_compare_single_text_file_with_differences(self):
+        """Test _compare_single_text_file detects differences between files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            working_path = os.path.join(tmpdir, "working.css")
+            broken_path = os.path.join(tmpdir, "broken.css")
+
+            with open(working_path, "w") as f:
+                f.write("body { color: red; }")
+            with open(broken_path, "w") as f:
+                f.write("body { color: blue; }")
+
+            results_list = []
+            _compare_single_text_file(
+                working_path,
+                broken_path,
+                "style.css",
+                "css",
+                "https://working.com",
+                "https://broken.com",
+                results_list,
+            )
+
+            self.assertEqual(len(results_list), 1)
+            self.assertEqual(results_list[0]["file"], "style.css")
+            self.assertIn("diff", results_list[0])
+            self.assertIn("red", results_list[0]["diff"])
+            self.assertIn("blue", results_list[0]["diff"])
+
+    def test_compare_single_text_file_identical(self):
+        """Test _compare_single_text_file with identical files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            working_path = os.path.join(tmpdir, "working.css")
+            broken_path = os.path.join(tmpdir, "broken.css")
+
+            with open(working_path, "w") as f:
+                f.write("body { color: red; }")
+            with open(broken_path, "w") as f:
+                f.write("body { color: red; }")
+
+            results_list = []
+            _compare_single_text_file(
+                working_path,
+                broken_path,
+                "style.css",
+                "css",
+                "https://working.com",
+                "https://broken.com",
+                results_list,
+            )
+
+            # No difference should be added
+            self.assertEqual(len(results_list), 0)
+
+    @patch("mega_diff.calculate_file_hash")
+    def test_compare_regular_images_identical(self, mock_hash):
+        """Test _compare_regular_images with identical images."""
+        mock_hash.return_value = "abc123"
+        working_images = ["/path/image.jpg"]
+        broken_images = ["/other/image.jpg"]
+        diff_results = {"images": []}
+
+        _compare_regular_images(working_images, broken_images, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(diff_results["images"][0]["status"], "identical")
+
+    @patch("mega_diff.calculate_file_hash")
+    def test_compare_regular_images_mismatch(self, mock_hash):
+        """Test _compare_regular_images with hash mismatch."""
+        mock_hash.side_effect = ["abc123", "def456"]
+        working_images = ["/path/image.jpg"]
+        broken_images = ["/other/image.jpg"]
+        diff_results = {"images": []}
+
+        _compare_regular_images(working_images, broken_images, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(diff_results["images"][0]["status"], "hash mismatch")
+        self.assertEqual(diff_results["images"][0]["working_hash"], "abc123")
+        self.assertEqual(diff_results["images"][0]["broken_hash"], "def456")
+
+    @patch("mega_diff.calculate_file_hash")
+    def test_compare_regular_images_missing_in_broken(self, mock_hash):
+        """Test _compare_regular_images with image missing in broken."""
+        mock_hash.return_value = "abc123"
+        working_images = ["/path/image.jpg"]
+        broken_images = []
+        diff_results = {"images": []}
+
+        _compare_regular_images(working_images, broken_images, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(diff_results["images"][0]["status"], "missing in broken")
+
+    @patch("mega_diff.calculate_file_hash")
+    def test_compare_regular_images_missing_in_working(self, mock_hash):
+        """Test _compare_regular_images with image missing in working."""
+        mock_hash.return_value = "abc123"
+        working_images = []
+        broken_images = ["/path/image.jpg"]
+        diff_results = {"images": []}
+
+        _compare_regular_images(working_images, broken_images, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(diff_results["images"][0]["status"], "missing in working")
+
+    def test_compare_data_uri_images_identical(self):
+        """Test _compare_data_uri_images with identical data URIs."""
+        working_uris = [{"name": "img1", "content": "data:image/png;base64,ABC123"}]
+        broken_uris = [{"name": "img1", "content": "data:image/png;base64,ABC123"}]
+        diff_results = {"images": []}
+
+        _compare_data_uri_images(working_uris, broken_uris, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(diff_results["images"][0]["status"], "identical (data URI)")
+
+    def test_compare_data_uri_images_mismatch(self):
+        """Test _compare_data_uri_images with content mismatch."""
+        working_uris = [{"name": "img1", "content": "data:image/png;base64,ABC"}]
+        broken_uris = [{"name": "img1", "content": "data:image/png;base64,DEF"}]
+        diff_results = {"images": []}
+
+        _compare_data_uri_images(working_uris, broken_uris, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(
+            diff_results["images"][0]["status"], "hash mismatch (data URI)"
+        )
+        self.assertIn("working_data_uri", diff_results["images"][0])
+        self.assertIn("broken_data_uri", diff_results["images"][0])
+
+    def test_compare_data_uri_images_missing_in_broken(self):
+        """Test _compare_data_uri_images with URI missing in broken."""
+        working_uris = [{"name": "img1", "content": "data:..."}]
+        broken_uris = []
+        diff_results = {"images": []}
+
+        _compare_data_uri_images(working_uris, broken_uris, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(
+            diff_results["images"][0]["status"], "missing in broken (data URI)"
+        )
+
+    def test_compare_data_uri_images_missing_in_working(self):
+        """Test _compare_data_uri_images with URI missing in working."""
+        working_uris = []
+        broken_uris = [{"name": "img1", "content": "data:..."}]
+        diff_results = {"images": []}
+
+        _compare_data_uri_images(working_uris, broken_uris, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        self.assertEqual(
+            diff_results["images"][0]["status"], "missing in working (data URI)"
+        )
+
+    def test_compare_data_uri_images_truncates_preview(self):
+        """Test _compare_data_uri_images truncates long URIs to DATA_URI_PREVIEW_LENGTH."""
+        long_uri = "data:" + "x" * (DATA_URI_PREVIEW_LENGTH + 50)
+        working_uris = [{"name": "img1", "content": long_uri}]
+        broken_uris = [{"name": "img1", "content": long_uri + "different"}]
+        diff_results = {"images": []}
+
+        _compare_data_uri_images(working_uris, broken_uris, diff_results)
+
+        self.assertEqual(len(diff_results["images"]), 1)
+        # The preview should be truncated and have "..." appended
+        preview = diff_results["images"][0]["working_data_uri"]
+        self.assertEqual(len(preview), DATA_URI_PREVIEW_LENGTH + 3)  # +3 for "..."
+        self.assertTrue(preview.endswith("..."))
 
 
 if __name__ == "__main__":

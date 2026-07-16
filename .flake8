@@ -1,3 +1,4 @@
+# Black owns formatting/line length; E501 and W503 are ignored for compatibility
 [flake8]
 max-line-length = 88
-ignore = E501,W503
+extend-ignore = E501, W503

@@ -68,6 +68,11 @@ python mega_diff.py <working_url> <broken_url>
 - `<working_url>`: The URL of the page that is working (e.g., production)
 - `<broken_url>`: The URL of the page that is broken or under development
 
+Optional flags:
+
+- `--output <dir>`: Output directory for downloaded resources and the report (default: `mega_diff_output`)
+- `--verbose` / `-v`: Enable verbose (debug) logging
+
 **Example:**
 
 ```bash
@@ -91,7 +96,13 @@ This will automatically find and run all tests in the `tests/` directory. Make s
 If you want to contribute to this project, please set up the development environment:
 
 1. **Follow the installation steps above** to set up the basic environment.
-2. **Install pre-commit hooks** for code quality:
+2. **Install the development dependencies** (linters and pre-commit):
+
+   ```bash
+   pip install -r requirements-dev.txt
+   ```
+
+3. **Install pre-commit hooks** for code quality:
 
    ```bash
    pre-commit install
@@ -99,7 +110,7 @@ If you want to contribute to this project, please set up the development environ
 
    This will automatically run code formatting (Black) and linting (flake8) before each commit to ensure code quality standards.
 
-3. **Run pre-commit manually** (optional):
+4. **Run pre-commit manually** (optional):
 
    ```bash
    pre-commit run --all-files

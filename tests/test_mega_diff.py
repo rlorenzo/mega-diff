@@ -12,11 +12,18 @@ from mega_diff import (
     filter_content_for_diff,
     soup_to_dict,
     _create_file_map,
+    _determine_file_name_and_path,
+    _download_images_from_inline_styles,
+    _extract_css_urls,
+    _extract_srcset_urls,
+    _format_css_diffs,
     _format_diff_lines,
+    _format_single_image_diff,
     _compare_single_text_file,
     _separate_image_types,
     _compare_regular_images,
     _compare_data_uri_images,
+    _validate_html_files,
     DATA_URI_PREVIEW_LENGTH,
 )
 
@@ -488,6 +495,121 @@ class TestMegaDiff(unittest.TestCase):
         self.assertEqual(broken_preview, short_uri_broken)
         self.assertFalse(working_preview.endswith("..."))
         self.assertFalse(broken_preview.endswith("..."))
+
+    def test_extract_css_urls_unquoted(self):
+        """Test _extract_css_urls extracts unquoted url() values."""
+        self.assertEqual(
+            _extract_css_urls("body { background: url(img/bg.png); }"),
+            ["img/bg.png"],
+        )
+
+    def test_extract_css_urls_quoted(self):
+        """Test _extract_css_urls extracts single- and double-quoted url() values."""
+        self.assertEqual(
+            _extract_css_urls('.a { background: url("a.png"); }'), ["a.png"]
+        )
+        self.assertEqual(
+            _extract_css_urls(".b { background: url('b.png'); }"), ["b.png"]
+        )
+
+    def test_extract_css_urls_multiple(self):
+        """Test _extract_css_urls extracts multiple url() values from one text."""
+        css = ".a { background: url(a.png); } .b { background: url('b.jpg'); }"
+        self.assertEqual(_extract_css_urls(css), ["a.png", "b.jpg"])
+
+    def test_extract_css_urls_skips_data_uris(self):
+        """Test _extract_css_urls skips data: URIs."""
+        css = ".a { background: url(data:image/png;base64,ABC); }"
+        self.assertEqual(_extract_css_urls(css), [])
+
+    def test_extract_css_urls_empty(self):
+        """Test _extract_css_urls returns empty list for empty text."""
+        self.assertEqual(_extract_css_urls(""), [])
+
+    def test_extract_srcset_urls_basic(self):
+        """Test _extract_srcset_urls parses a normal srcset value."""
+        self.assertEqual(_extract_srcset_urls("a.jpg 1x, b.jpg 2x"), ["a.jpg", "b.jpg"])
+
+    def test_extract_srcset_urls_trailing_comma(self):
+        """Test _extract_srcset_urls does not crash on trailing commas."""
+        self.assertEqual(
+            _extract_srcset_urls("a.jpg 1x, b.jpg 2x,"), ["a.jpg", "b.jpg"]
+        )
+
+    def test_extract_srcset_urls_only_commas(self):
+        """Test _extract_srcset_urls returns empty list for commas-only input."""
+        self.assertEqual(_extract_srcset_urls(",, ,"), [])
+
+    def test_extract_srcset_urls_skips_data_uris(self):
+        """Test _extract_srcset_urls skips data: URI entries."""
+        self.assertEqual(
+            _extract_srcset_urls("data:image/png;base64ABC 1x, real.jpg 2x"),
+            ["real.jpg"],
+        )
+
+    def test_determine_file_name_and_path_confines_traversal(self):
+        """Test _determine_file_name_and_path keeps paths inside base_dir."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = os.path.join(tmpdir, "out")
+            os.makedirs(base_dir)
+            save_path = _determine_file_name_and_path(
+                "http://example.com/../../etc/passwd.txt", base_dir
+            )
+            base_abs = os.path.abspath(base_dir)
+            self.assertEqual(
+                os.path.commonpath([base_abs, os.path.abspath(save_path)]),
+                base_abs,
+            )
+
+    def test_format_single_image_diff_escapes_data_uri(self):
+        """Test _format_single_image_diff escapes HTML in data URI previews."""
+        diff_item = {
+            "file": "img1",
+            "status": "identical (data URI)",
+            "data_uri": "data:text/html,<script>alert('xss')</script>",
+        }
+        result = _format_single_image_diff(diff_item)
+        self.assertIn("&lt;script&gt;", result)
+        self.assertNotIn("<script>", result)
+
+    def test_format_css_diffs_escapes_file_name(self):
+        """Test _format_css_diffs escapes HTML in file names."""
+        css_diff_items = [{"file": "style<b>.css", "status": "missing in broken"}]
+        result = _format_css_diffs(css_diff_items)
+        self.assertIn("style&lt;b&gt;.css", result)
+        self.assertNotIn("style<b>.css", result)
+
+    def test_validate_html_files_both_present(self):
+        """Test _validate_html_files returns True when both HTML files exist."""
+        working = {"html": "/tmp/working.html"}
+        broken = {"html": "/tmp/broken.html"}
+        self.assertTrue(
+            _validate_html_files(working, broken, "https://a.com", "https://b.com")
+        )
+
+    def test_validate_html_files_missing(self):
+        """Test _validate_html_files returns False when either HTML file is missing."""
+        working = {"html": "/tmp/working.html"}
+        broken = {"html": None}
+        self.assertFalse(
+            _validate_html_files(working, broken, "https://a.com", "https://b.com")
+        )
+        self.assertFalse(
+            _validate_html_files(broken, working, "https://a.com", "https://b.com")
+        )
+
+    @patch("mega_diff._fetch_and_save_resource", return_value="/tmp/bg.png")
+    def test_download_images_from_inline_styles(self, mock_fetch):
+        """Test inline style url() extraction downloads the image without crashing."""
+        soup = BeautifulSoup(
+            '<div style="background-image: url(bg.png)">x</div>', "html.parser"
+        )
+        downloaded_files = {"images": []}
+        _download_images_from_inline_styles(
+            soup, "https://example.com", None, "/tmp", downloaded_files
+        )
+        self.assertEqual(downloaded_files["images"], ["/tmp/bg.png"])
+        mock_fetch.assert_called_once_with("https://example.com/bg.png", None, "/tmp")
 
 
 if __name__ == "__main__":

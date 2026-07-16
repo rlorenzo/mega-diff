@@ -2,6 +2,7 @@ import argparse
 import requests
 from urllib.parse import urljoin, urlparse
 import os
+import sys
 import hashlib
 from bs4 import BeautifulSoup
 from bs4.element import Comment
@@ -15,9 +16,47 @@ from deepdiff import DeepDiff
 # Constants
 CHUNK_SIZE = 8192
 DATA_URI_PREVIEW_LENGTH = 100
+REQUEST_TIMEOUT = 30
+
+CSS_URL_PATTERN = re.compile(r"url\(\s*['\"]?(.*?)['\"]?\s*\)", re.IGNORECASE)
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+def _extract_css_urls(text):
+    """Extracts URL values from CSS url(...) expressions, skipping data URIs.
+
+    Args:
+        text: CSS text (a stylesheet or an inline style value).
+
+    Returns:
+        List of non-empty URL strings, excluding data: URIs.
+    """
+    return [
+        u.strip()
+        for u in CSS_URL_PATTERN.findall(text)
+        if u.strip() and not u.strip().startswith("data:")
+    ]
+
+
+def _extract_srcset_urls(srcset):
+    """Extracts candidate URLs from a srcset attribute value.
+
+    Skips empty entries (e.g., from trailing commas) and data: URIs.
+
+    Args:
+        srcset: The raw srcset attribute value.
+
+    Returns:
+        List of URL strings.
+    """
+    urls = []
+    for src_desc in srcset.split(","):
+        parts = src_desc.strip().split()
+        if parts and not parts[0].startswith("data:"):
+            urls.append(parts[0])
+    return urls
 
 
 def _get_file_extension_from_content_type(content_type):
@@ -46,7 +85,11 @@ def _determine_file_name_and_path(url, base_dir, content_type=None):
         # It's a directory without trailing slash, add it to treat as directory
         url_path_dir += "/"
 
-    save_dir = os.path.join(base_dir, url_path_dir)
+    # Confine the save path to base_dir; URL paths may contain ".." segments
+    save_dir = os.path.normpath(os.path.join(base_dir, url_path_dir))
+    base_dir_abs = os.path.abspath(base_dir)
+    if os.path.commonpath([base_dir_abs, os.path.abspath(save_dir)]) != base_dir_abs:
+        save_dir = base_dir_abs
     os.makedirs(save_dir, exist_ok=True)
 
     if not file_name or file_name.endswith("/"):
@@ -80,7 +123,7 @@ def _fetch_and_save_resource(url, session, base_dir):
         The file path where the resource was saved, or None if fetch failed.
     """
     try:
-        response = session.get(url, stream=True)
+        response = session.get(url, stream=True, timeout=REQUEST_TIMEOUT)
         logger.debug("Fetching %s", url)
         response.raise_for_status()
         logger.debug("Status Code for %s: %d", url, response.status_code)
@@ -109,22 +152,28 @@ def scrape_page(url, output_dir):
         A dictionary containing paths to downloaded HTML, CSS, JS, and image files.
     """
     logger.info("Scraping %s...", url)
-    session = requests.Session()
     downloaded_files = {"html": None, "css": [], "js": [], "images": []}
 
-    url_hostname = urlparse(url).hostname
-    page_dir = os.path.join(output_dir, url_hostname)
+    parsed_url = urlparse(url)
+    if not parsed_url.hostname:
+        logger.error("Invalid URL, no hostname: %s", url)
+        return downloaded_files
+
+    # Use the full netloc (host + port) so pages on the same host but
+    # different ports don't overwrite each other's downloads
+    page_dir = os.path.join(output_dir, parsed_url.netloc.replace(":", "_"))
     os.makedirs(page_dir, exist_ok=True)
 
-    html_path = _fetch_and_save_resource(url, session, page_dir)
-    if html_path:
-        downloaded_files["html"] = html_path
-        with open(html_path, "r", encoding="utf-8") as f:
-            soup = BeautifulSoup(f.read(), "html.parser")
+    with requests.Session() as session:
+        html_path = _fetch_and_save_resource(url, session, page_dir)
+        if html_path:
+            downloaded_files["html"] = html_path
+            with open(html_path, "r", encoding="utf-8") as f:
+                soup = BeautifulSoup(f.read(), "html.parser")
 
-        _download_css_files(soup, url, session, page_dir, downloaded_files)
-        _download_js_files(soup, url, session, page_dir, downloaded_files)
-        _download_image_files(soup, url, session, page_dir, downloaded_files)
+            _download_css_files(soup, url, session, page_dir, downloaded_files)
+            _download_js_files(soup, url, session, page_dir, downloaded_files)
+            _download_image_files(soup, url, session, page_dir, downloaded_files)
 
     return downloaded_files
 
@@ -156,8 +205,7 @@ def _download_images_from_css(css_path, css_url, session, page_dir, downloaded_f
     try:
         with open(css_path, "r", encoding="utf-8") as f:
             css_content = f.read()
-        css_image_urls = re.findall(r'url(["\\]?(.*?)["\\]?)', css_content)
-        for css_img_rel_url in css_image_urls:
+        for css_img_rel_url in _extract_css_urls(css_content):
             css_img_url = urljoin(css_url, css_img_rel_url)
             img_path = _fetch_and_save_resource(css_img_url, session, page_dir)
             if img_path:
@@ -204,7 +252,12 @@ def _download_images_from_img_tags(soup, base_url, session, page_dir, downloaded
         if src:
             if src.startswith("data:"):
                 logger.debug("Found inline data URI image: %s...", src[:50])
-                data_uri_name = f"data_uri_image_{len(downloaded_files['images'])}"
+                # Index by data-URI count (not total images) so names stay
+                # aligned between pages whose regular image counts differ
+                data_uri_index = sum(
+                    1 for item in downloaded_files["images"] if isinstance(item, dict)
+                )
+                data_uri_name = f"data_uri_image_{data_uri_index}"
                 downloaded_files["images"].append(
                     {"type": "data_uri", "name": data_uri_name, "content": src}
                 )
@@ -217,15 +270,11 @@ def _download_images_from_img_tags(soup, base_url, session, page_dir, downloaded
         # Handle srcset attribute for responsive images
         srcset = img.get("srcset")
         if srcset:
-            for src_desc in srcset.split(","):
-                src_part = src_desc.strip().split()[0]
-                if src_part and not src_part.startswith("data:"):
-                    full_srcset_url = urljoin(base_url, src_part)
-                    img_path = _fetch_and_save_resource(
-                        full_srcset_url, session, page_dir
-                    )
-                    if img_path:
-                        downloaded_files["images"].append(img_path)
+            for src_part in _extract_srcset_urls(srcset):
+                full_srcset_url = urljoin(base_url, src_part)
+                img_path = _fetch_and_save_resource(full_srcset_url, session, page_dir)
+                if img_path:
+                    downloaded_files["images"].append(img_path)
 
         # Handle data-src attribute (lazy loading)
         data_src = img.get("data-src")
@@ -244,13 +293,11 @@ def _download_images_from_picture_elements(
         for source in picture.find_all("source"):
             srcset = source.get("srcset")
             if srcset:
-                for src_desc in srcset.split(","):
-                    src_part = src_desc.strip().split()[0]
-                    if src_part and not src_part.startswith("data:"):
-                        full_url = urljoin(base_url, src_part)
-                        img_path = _fetch_and_save_resource(full_url, session, page_dir)
-                        if img_path:
-                            downloaded_files["images"].append(img_path)
+                for src_part in _extract_srcset_urls(srcset):
+                    full_url = urljoin(base_url, src_part)
+                    img_path = _fetch_and_save_resource(full_url, session, page_dir)
+                    if img_path:
+                        downloaded_files["images"].append(img_path)
 
 
 def _download_images_from_inline_styles(
@@ -259,17 +306,11 @@ def _download_images_from_inline_styles(
     """Handles image downloads from inline styles (background-image)."""
     for element in soup.find_all(style=True):
         style_content = element.get("style", "")
-        bg_image_urls = re.findall(
-            r'background-image:\s*url(["\\]?(.*?)["\\]?)',
-            style_content,
-            re.IGNORECASE,
-        )
-        for bg_img_url in bg_image_urls:
-            if not bg_img_url.startswith("data:"):
-                full_bg_url = urljoin(base_url, bg_img_url)
-                img_path = _fetch_and_save_resource(full_bg_url, session, page_dir)
-                if img_path:
-                    downloaded_files["images"].append(img_path)
+        for bg_img_url in _extract_css_urls(style_content):
+            full_bg_url = urljoin(base_url, bg_img_url)
+            img_path = _fetch_and_save_resource(full_bg_url, session, page_dir)
+            if img_path:
+                downloaded_files["images"].append(img_path)
 
 
 def _download_svg_sprites(soup, base_url, session, page_dir, downloaded_files):
@@ -524,15 +565,16 @@ def _format_css_diffs(css_diff_items):
 
     result = ""
     for diff_item in css_diff_items:
+        file_name = html.escape(diff_item["file"])
         if "diff" in diff_item:
             result += (
-                f"<div class='summary-item'><h3>CSS File: {diff_item['file']}</h3>"
+                f"<div class='summary-item'><h3>CSS File: {file_name}</h3>"
                 f"<div class='diff-content'>{_format_diff_lines(diff_item['diff'])}</div></div>"
             )
         else:
             result += (
-                f"<div class='summary-item'><p>CSS File: {diff_item['file']} - "
-                f"{diff_item['status']}</p></div>"
+                f"<div class='summary-item'><p>CSS File: {file_name} - "
+                f"{html.escape(diff_item['status'])}</p></div>"
             )
     return result
 
@@ -551,15 +593,16 @@ def _format_js_diffs(js_diff_items):
 
     result = ""
     for diff_item in js_diff_items:
+        file_name = html.escape(diff_item["file"])
         if "diff" in diff_item:
             result += (
-                f"<div class='summary-item'><h3>JavaScript File: {diff_item['file']}</h3>"
+                f"<div class='summary-item'><h3>JavaScript File: {file_name}</h3>"
                 f"<div class='diff-content'>{_format_diff_lines(diff_item['diff'])}</div></div>"
             )
         else:
             result += (
-                f"<div class='summary-item'><p>JavaScript File: {diff_item['file']} - "
-                f"{diff_item['status']}</p></div>"
+                f"<div class='summary-item'><p>JavaScript File: {file_name} - "
+                f"{html.escape(diff_item['status'])}</p></div>"
             )
     return result
 
@@ -592,13 +635,13 @@ def _format_single_image_diff(diff_item):
         HTML string for this image diff.
     """
     status = diff_item["status"]
-    file_name = diff_item["file"]
+    file_name = html.escape(diff_item["file"])
 
     if status == "hash mismatch":
         return (
             f"<div class='summary-item'><p style='color: red;'>Image: {file_name} - Hash Mismatch</p>"
-            f"<p style='color: #666;'>Working Hash: {diff_item['working_hash']}</p>"
-            f"<p style='color: #666;'>Broken Hash: {diff_item['broken_hash']}</p></div>"
+            f"<p style='color: #666;'>Working Hash: {html.escape(diff_item['working_hash'])}</p>"
+            f"<p style='color: #666;'>Broken Hash: {html.escape(diff_item['broken_hash'])}</p></div>"
         )
     elif status == "identical":
         return f"<div class='summary-item'><p style='color: green;'>Image: {file_name} - Identical</p></div>"
@@ -611,18 +654,18 @@ def _format_single_image_diff(diff_item):
         )
         return (
             f"<div class='summary-item'><p style='color: green;'>Image: {file_name} - Identical (data URI)</p>"
-            f"<p style='font-size: 12px; color: #666;'>Data URI: {data_uri_preview}</p></div>"
+            f"<p style='font-size: 12px; color: #666;'>Data URI: {html.escape(data_uri_preview)}</p></div>"
         )
     elif status == "hash mismatch (data URI)":
         return (
             f"<div class='summary-item'><p style='color: red;'>Image: {file_name} - Hash Mismatch (data URI)</p>"
-            f"<p style='font-size: 12px; color: #666;'>Working URI: {diff_item.get('working_data_uri', '')}</p>"
-            f"<p style='font-size: 12px; color: #666;'>Broken URI: {diff_item.get('broken_data_uri', '')}</p></div>"
+            f"<p style='font-size: 12px; color: #666;'>Working URI: {html.escape(diff_item.get('working_data_uri', ''))}</p>"
+            f"<p style='font-size: 12px; color: #666;'>Broken URI: {html.escape(diff_item.get('broken_data_uri', ''))}</p></div>"
         )
     elif "missing" in status:
-        return f"<div class='summary-item'><p style='color: orange;'>Image: {file_name} - {status}</p></div>"
+        return f"<div class='summary-item'><p style='color: orange;'>Image: {file_name} - {html.escape(status)}</p></div>"
     else:
-        return f"<div class='summary-item'><p>Image: {file_name} - {status}</p></div>"
+        return f"<div class='summary-item'><p>Image: {file_name} - {html.escape(status)}</p></div>"
 
 
 def soup_to_dict(soup):
@@ -682,8 +725,16 @@ def _compare_html(working_files, broken_files, working_url, broken_url, diff_res
         normalized_broken_html, working_url, broken_url
     )
 
-    working_soup = BeautifulSoup(working_html_content, "html.parser")
-    broken_soup = BeautifulSoup(broken_html_content, "html.parser")
+    # Filter domains/protocols before the semantic diff too, so pages that
+    # differ only by hostname are not reported as semantically different
+    working_soup = BeautifulSoup(
+        filter_content_for_diff(working_html_content, working_url, broken_url),
+        "html.parser",
+    )
+    broken_soup = BeautifulSoup(
+        filter_content_for_diff(broken_html_content, working_url, broken_url),
+        "html.parser",
+    )
     working_dict = soup_to_dict(working_soup)
     broken_dict = soup_to_dict(broken_soup)
 
@@ -1105,7 +1156,7 @@ def main():
     if not _validate_html_files(
         working_files, broken_files, args.working_url, args.broken_url
     ):
-        exit(1)
+        sys.exit(1)
 
     diff_results = {"html": [], "css": [], "js": [], "images": []}
 
